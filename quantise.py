@@ -19,7 +19,7 @@ class VectorQuantiser(nn.Module):
     contras_loss: 如果为真，则使用对比损失以进一步提高性能
     """
     def __init__(self, num_embed, embed_dim, beta, distance='cos', 
-                 anchor='probrandom', first_batch=False, contras_loss=False):
+                 anchor='probrandom', first_batch=False, contras_loss=False,m=2):
         super().__init__()
         self.num_embed = num_embed  # 代码本条目数量
         self.embed_dim = embed_dim  # 代码本条目维度
@@ -35,6 +35,7 @@ class VectorQuantiser(nn.Module):
         # 初始化嵌入权重
         self.embedding.weight.data.uniform_(-1.0 / self.num_embed, 1.0 / self.num_embed)
         self.register_buffer("embed_prob", torch.zeros(self.num_embed))  # 嵌入概率缓冲区
+        self.m=m
 
     def forward(self, z, temp=None, rescale_logits=False, return_logits=False):
         # 确保与Gumbel接口兼容
@@ -52,6 +53,16 @@ class VectorQuantiser(nn.Module):
             d = - torch.sum(z_flattened.detach() ** 2, dim=1, keepdim=True) - \
                 torch.sum(self.embedding.weight ** 2, dim=1) + \
                 2 * torch.einsum('bd, dn-> bn', z_flattened.detach(), rearrange(self.embedding.weight, 'n d-> d n'))
+            # print(d.shape) # torch.Size([50176, 512])
+            
+            ############################
+            # 计算隶属度（隶属度矩阵）
+            inv_distances = 1.0 / (d + 1e-8)  # 避免零距离
+            weights = inv_distances ** (1 / (self.m - 1))
+            membership = weights / weights.sum(dim=1, keepdim=True)  # [Batch * Feature, num_embeddings]
+            ############################
+            # print("membership",membership.shape) # torch.Size([50176, 512])
+            
         elif self.distance == 'cos':
             # 计算余弦距离
             normed_z_flattened = F.normalize(z_flattened, dim=1).detach()  # 对 z 进行归一化
@@ -84,26 +95,19 @@ class VectorQuantiser(nn.Module):
         if self.training:
             # 计算代码条目的平均使用情况
             self.embed_prob.mul_(self.decay).add_(avg_probs, alpha=1 - self.decay)  # 更新嵌入概率
-            # 基于平均使用情况的衰减
-            if self.anchor in ['closest', 'random', 'probrandom'] and (not self.init):
-                # 最近采样
-                if self.anchor == 'closest':
-                    sort_distance, indices = d.sort(dim=0)
-                    random_feat = z_flattened.detach()[indices[-1, :]]  # 获取最近的特征
-                # 基于特征池的随机采样
-                elif self.anchor == 'random':
-                    random_feat = self.pool.query(z_flattened.detach())
-                # 基于概率的随机采样
-                elif self.anchor == 'probrandom':
-                    norm_distance = F.softmax(d.t(), dim=1)
-                    prob = torch.multinomial(norm_distance, num_samples=1).view(-1)
-                    random_feat = z_flattened.detach()[prob]  # 随机选择特征
+
+            # 计算加权特征
+            weighted_features = z_flattened.detach().unsqueeze(1) * membership.unsqueeze(2)  # (batch * feature, num_embeddings, embed_dim)
+
+            # 对每个 codebook 向量的加权特征进行求和
+            random_feat = weighted_features.sum(dim=0)  # (num_embeddings, embed_dim)
+            # print(random_feat1.shape) # torch.Size([512, 64])
                 
-                # 更新嵌入权重
-                decay = torch.exp(-(self.embed_prob * self.num_embed * 10) / (1 - self.decay) - 1e-3).unsqueeze(1).repeat(1, self.embed_dim)
-                self.embedding.weight.data = self.embedding.weight.data * (1 - decay) + random_feat * decay
-                if self.first_batch:
-                    self.init = True  # 如果是第一批，设置初始化标志为真
+            # 更新嵌入权重
+            decay = torch.exp(-(self.embed_prob * self.num_embed * 10) / (1 - self.decay) - 1e-3).unsqueeze(1).repeat(1, self.embed_dim)
+            self.embedding.weight.data = self.embedding.weight.data * (1 - decay) + random_feat * decay
+            if self.first_batch:
+                self.init = True  # 如果是第一批，设置初始化标志为真
             
             # 对比损失
             if self.contras_loss:
